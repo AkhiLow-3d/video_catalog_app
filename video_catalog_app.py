@@ -43,7 +43,6 @@ VIDEO_EXTENSIONS = {
 }
 THUMB_SIZE = 220
 
-# ここを編集すると、コレクションのプリセット候補を変更できます。
 PRESET_COLLECTIONS = [
     "モデリング",
     "アニメーション",
@@ -55,7 +54,6 @@ PRESET_COLLECTIONS = [
     "チュートリアル",
 ]
 
-# ここを編集すると、タグのプリセット候補を変更できます。
 PRESET_TAGS = [
     "wood",
     "metal",
@@ -208,6 +206,15 @@ class Database:
             self.conn.execute("ALTER TABLE videos ADD COLUMN is_ignored INTEGER DEFAULT 0")
             self.conn.commit()
 
+    def begin(self) -> None:
+        self.conn.execute("BEGIN")
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def rollback(self) -> None:
+        self.conn.rollback()
+
     def reset_all_data(self) -> None:
         self.conn.close()
         if self.db_path.exists():
@@ -246,6 +253,13 @@ class Database:
             "SELECT * FROM videos WHERE absolute_path = ?",
             (str(absolute_path),),
         ).fetchone()
+
+    def get_library_video_map(self, library_id: int) -> dict[str, sqlite3.Row]:
+        rows = self.conn.execute(
+            "SELECT * FROM videos WHERE library_id = ?",
+            (library_id,),
+        ).fetchall()
+        return {row["absolute_path"]: row for row in rows}
 
     def upsert_video(
         self,
@@ -303,26 +317,82 @@ class Database:
                     modified_time,
                 ),
             )
-        self.conn.commit()
+
+    def upsert_video_by_existing_row(
+        self,
+        existing: Optional[sqlite3.Row],
+        library_id: int,
+        title: str,
+        filename: str,
+        absolute_path: Path,
+        relative_path: Optional[str],
+        thumbnail_path: Optional[Path],
+        file_size: int,
+        modified_time: float,
+    ) -> None:
+        if existing:
+            self.conn.execute(
+                """
+                UPDATE videos
+                SET title = ?,
+                    filename = ?,
+                    relative_path = ?,
+                    thumbnail_path = ?,
+                    file_size = ?,
+                    modified_time = ?,
+                    is_missing = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    title,
+                    filename,
+                    relative_path,
+                    str(thumbnail_path) if thumbnail_path else None,
+                    file_size,
+                    modified_time,
+                    int(existing["id"]),
+                ),
+            )
+        else:
+            self.conn.execute(
+                """
+                INSERT INTO videos (
+                    library_id, title, filename, absolute_path, relative_path,
+                    thumbnail_path, file_size, modified_time, is_missing, is_ignored
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+                """,
+                (
+                    library_id,
+                    title,
+                    filename,
+                    str(absolute_path),
+                    relative_path,
+                    str(thumbnail_path) if thumbnail_path else None,
+                    file_size,
+                    modified_time,
+                ),
+            )
 
     def mark_missing_for_library(self, library_id: int) -> None:
         self.conn.execute(
             "UPDATE videos SET is_missing = 1, updated_at = CURRENT_TIMESTAMP WHERE library_id = ?",
             (library_id,),
         )
-        self.conn.commit()
 
     def get_videos(
         self,
         search_text: str = "",
         missing_only: bool = False,
-        include_ignored: bool = False,
+        ignored_only: bool = False,
     ):
         query = "SELECT * FROM videos"
         clauses = []
         params = []
 
-        if not include_ignored:
+        if ignored_only:
+            clauses.append("is_ignored = 1")
+        else:
             clauses.append("is_ignored = 0")
 
         if search_text.strip():
@@ -338,7 +408,7 @@ class Database:
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
 
-        query += " ORDER BY is_missing DESC, updated_at DESC, title COLLATE NOCASE ASC"
+        query += " ORDER BY is_ignored ASC, is_missing DESC, updated_at DESC, title COLLATE NOCASE ASC"
         return self.conn.execute(query, params).fetchall()
 
     def get_video(self, video_id: int):
@@ -346,6 +416,15 @@ class Database:
             "SELECT * FROM videos WHERE id = ?",
             (video_id,),
         ).fetchone()
+
+    def get_videos_by_ids(self, video_ids: list[int]) -> list[sqlite3.Row]:
+        if not video_ids:
+            return []
+        placeholders = ",".join("?" for _ in video_ids)
+        return self.conn.execute(
+            f"SELECT * FROM videos WHERE id IN ({placeholders})",
+            video_ids,
+        ).fetchall()
 
     def update_video_metadata(
         self,
@@ -365,12 +444,26 @@ class Database:
         )
         self.conn.commit()
 
+    def update_video_metadata_bulk(self, updates: list[tuple[str, str, str, str, int]]) -> None:
+        if not updates:
+            return
+        self.conn.executemany(
+            """
+            UPDATE videos
+            SET title = ?, tags = ?, collections = ?, note = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            updates,
+        )
+        self.conn.commit()
+
     def set_ignored(self, video_ids: list[int], ignored: bool = True) -> None:
-        for video_id in video_ids:
-            self.conn.execute(
-                "UPDATE videos SET is_ignored = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (1 if ignored else 0, video_id),
-            )
+        if not video_ids:
+            return
+        self.conn.executemany(
+            "UPDATE videos SET is_ignored = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [(1 if ignored else 0, video_id) for video_id in video_ids],
+        )
         self.conn.commit()
 
     def close(self) -> None:
@@ -385,12 +478,13 @@ class MainWindow(QMainWindow):
         self.collection_buttons: dict[str, QPushButton] = {}
         self.tag_buttons: dict[str, QPushButton] = {}
         self._updating_fields = False
+        self._filter_lists_dirty = True
 
         self.setWindowTitle(APP_NAME)
         self.resize(1500, 920)
 
         self._build_ui()
-        self.reload_list()
+        self.reload_list(force_refresh_filters=True)
 
     def _build_ui(self) -> None:
         self._build_toolbar()
@@ -414,6 +508,11 @@ class MainWindow(QMainWindow):
         self.missing_filter_btn.setCheckable(True)
         self.missing_filter_btn.toggled.connect(self._on_toggle_missing_filter)
         top_bar.addWidget(self.missing_filter_btn)
+
+        self.ignored_only_btn = QPushButton("無視のみ表示: OFF")
+        self.ignored_only_btn.setCheckable(True)
+        self.ignored_only_btn.toggled.connect(self._on_toggle_ignored_only)
+        top_bar.addWidget(self.ignored_only_btn)
 
         self.result_label = QLabel("0件")
         top_bar.addWidget(self.result_label)
@@ -580,13 +679,20 @@ class MainWindow(QMainWindow):
         reload_action.triggered.connect(self.reload_list)
         toolbar.addAction(reload_action)
 
-        ignore_action = QAction("選択中を無視", self)
+        ignore_action = QAction("無視する", self)
         ignore_action.triggered.connect(self.ignore_selected_videos)
         toolbar.addAction(ignore_action)
+
+        unignore_action = QAction("無視を解除", self)
+        unignore_action.triggered.connect(self.unignore_selected_videos)
+        toolbar.addAction(unignore_action)
 
         reset_action = QAction("データ初期化", self)
         reset_action.triggered.connect(self.reset_all_data)
         toolbar.addAction(reset_action)
+
+    def _mark_filter_lists_dirty(self) -> None:
+        self._filter_lists_dirty = True
 
     def _on_toggle_missing_filter(self, checked: bool) -> None:
         self.missing_filter_btn.setText(f"リンク切れのみ: {'ON' if checked else 'OFF'}")
@@ -595,6 +701,10 @@ class MainWindow(QMainWindow):
     def _on_toggle_unclassified_filter(self, checked: bool) -> None:
         self.unclassified_filter_btn.setText(f"未分類のみ: {'ON' if checked else 'OFF'}")
         self.reload_list()
+
+    def _on_toggle_ignored_only(self, checked: bool) -> None:
+        self.ignored_only_btn.setText(f"無視のみ表示: {'ON' if checked else 'OFF'}")
+        self.reload_list(force_refresh_filters=True)
 
     def clear_all_filters(self) -> None:
         self.search_input.clear()
@@ -613,7 +723,8 @@ class MainWindow(QMainWindow):
         root = Path(folder)
         library_id = self.db.get_or_create_library(root)
         self.scan_library(root, library_id)
-        self.reload_list()
+        self._mark_filter_lists_dirty()
+        self.reload_list(force_refresh_filters=True)
         QMessageBox.information(self, APP_NAME, f"スキャン完了: {root}")
 
     def rescan_all_libraries(self) -> None:
@@ -627,7 +738,8 @@ class MainWindow(QMainWindow):
             library_id = int(row["id"])
             self.scan_library(root, library_id)
 
-        self.reload_list()
+        self._mark_filter_lists_dirty()
+        self.reload_list(force_refresh_filters=True)
         QMessageBox.information(self, APP_NAME, "全ライブラリを再スキャンしました。")
 
     def reset_all_data(self) -> None:
@@ -642,52 +754,94 @@ class MainWindow(QMainWindow):
             return
 
         self.db.reset_all_data()
+        self._mark_filter_lists_dirty()
         self.clear_all_filters()
         self.clear_detail()
-        self.reload_list()
+        self.reload_list(force_refresh_filters=True)
         QMessageBox.information(self, APP_NAME, "データを初期化しました。")
 
     def scan_library(self, root: Path, library_id: int) -> None:
-        self.db.mark_missing_for_library(library_id)
-
         if not root.exists():
             return
 
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            if path.suffix.lower() not in VIDEO_EXTENSIONS:
-                continue
+        existing_map = self.db.get_library_video_map(library_id)
 
-            try:
-                stat = path.stat()
-                rel = str(path.relative_to(root))
-            except Exception:
-                continue
+        try:
+            self.db.begin()
+            self.db.mark_missing_for_library(library_id)
 
-            existing = self.db.find_video_by_path(path)
-            if existing and int(existing["is_ignored"] or 0) == 1:
-                self.db.conn.execute(
-                    "UPDATE videos SET is_missing = 0, modified_time = ?, file_size = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (stat.st_mtime, stat.st_size, int(existing["id"])),
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                if path.suffix.lower() not in VIDEO_EXTENSIONS:
+                    continue
+
+                try:
+                    stat = path.stat()
+                    rel = str(path.relative_to(root))
+                except Exception:
+                    continue
+
+                existing = existing_map.get(str(path))
+
+                if existing and int(existing["is_ignored"] or 0) == 1:
+                    self.db.conn.execute(
+                        """
+                        UPDATE videos
+                        SET is_missing = 0,
+                            modified_time = ?,
+                            file_size = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (stat.st_mtime, stat.st_size, int(existing["id"])),
+                    )
+                    continue
+
+                thumb_path: Optional[Path]
+                needs_thumb = True
+
+                if existing:
+                    same_mtime = float(existing["modified_time"] or 0) == float(stat.st_mtime)
+                    same_size = int(existing["file_size"] or 0) == int(stat.st_size)
+                    if same_mtime and same_size:
+                        existing_thumb = existing["thumbnail_path"]
+                        if existing_thumb and Path(existing_thumb).exists():
+                            needs_thumb = False
+                            thumb_path = Path(existing_thumb)
+                        else:
+                            thumb_path = ensure_thumbnail(path)
+                    else:
+                        thumb_path = ensure_thumbnail(path)
+                else:
+                    thumb_path = ensure_thumbnail(path)
+
+                if not needs_thumb and existing:
+                    thumb_path = Path(existing["thumbnail_path"]) if existing["thumbnail_path"] else None
+
+                self.db.upsert_video_by_existing_row(
+                    existing=existing,
+                    library_id=library_id,
+                    title=path.stem,
+                    filename=path.name,
+                    absolute_path=path,
+                    relative_path=rel,
+                    thumbnail_path=thumb_path,
+                    file_size=stat.st_size,
+                    modified_time=stat.st_mtime,
                 )
-                self.db.conn.commit()
-                continue
 
-            thumb_path = ensure_thumbnail(path)
-            self.db.upsert_video(
-                library_id=library_id,
-                title=path.stem,
-                filename=path.name,
-                absolute_path=path,
-                relative_path=rel,
-                thumbnail_path=thumb_path,
-                file_size=stat.st_size,
-                modified_time=stat.st_mtime,
-            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
-    def reload_list(self) -> None:
+    def reload_list(self, force_refresh_filters: bool = False) -> None:
         self.list_widget.clear()
+
+        if force_refresh_filters or self._filter_lists_dirty:
+            self.refresh_filter_lists()
+            self._filter_lists_dirty = False
 
         selected_collection_item = self.collection_list_widget.currentItem()
         selected_tag_item = self.tag_list_widget.currentItem()
@@ -708,6 +862,7 @@ class MainWindow(QMainWindow):
         rows = self.db.get_videos(
             search_text=self.search_input.text(),
             missing_only=self.missing_filter_btn.isChecked(),
+            ignored_only=self.ignored_only_btn.isChecked(),
         )
 
         if self.unclassified_filter_btn.isChecked():
@@ -746,6 +901,13 @@ class MainWindow(QMainWindow):
             tags = (row["tags"] or "").strip()
             collections = (row["collections"] or "").strip()
             missing = bool(row["is_missing"])
+            ignored = bool(row["is_ignored"])
+
+            display_title = title
+            if ignored:
+                display_title = f"[無視] {display_title}"
+            elif missing:
+                display_title = f"[リンク切れ] {display_title}"
 
             tooltip_lines = [title]
             if collections:
@@ -754,8 +916,10 @@ class MainWindow(QMainWindow):
                 tooltip_lines.append(f"タグ: {tags}")
             if missing:
                 tooltip_lines.append("[リンク切れ]")
+            if ignored:
+                tooltip_lines.append("[無視中]")
 
-            item = QListWidgetItem(title)
+            item = QListWidgetItem(display_title)
             item.setToolTip("\n".join(tooltip_lines))
             item.setData(Qt.UserRole, int(row["id"]))
             item.setSizeHint(QSize(220, 240))
@@ -772,7 +936,6 @@ class MainWindow(QMainWindow):
             self.list_widget.addItem(item)
 
         self.result_label.setText(f"{len(rows)}件")
-        self.refresh_filter_lists()
 
         if self.list_widget.count() > 0:
             self.list_widget.setCurrentRow(0)
@@ -796,7 +959,9 @@ class MainWindow(QMainWindow):
             else ""
         )
 
-        all_rows = self.db.get_videos()
+        all_rows = self.db.get_videos(
+            ignored_only=self.ignored_only_btn.isChecked()
+        )
         collections = sorted(
             {(row["collections"] or "").strip() for row in all_rows if (row["collections"] or "").strip()}
         )
@@ -882,20 +1047,22 @@ class MainWindow(QMainWindow):
             self.clear_detail()
             return
 
+        selected_ids = [int(item.data(Qt.UserRole)) for item in items]
+        rows = self.db.get_videos_by_ids(selected_ids)
+        row_map = {int(row["id"]): row for row in rows}
+
         if len(items) > 1:
             self.current_video_id = None
-            selected_ids = [int(item.data(Qt.UserRole)) for item in items]
+            selected_rows = [row_map[video_id] for video_id in selected_ids if video_id in row_map]
+
             self.title_edit.setText("")
             self.path_label.setText(f"{len(items)}件選択中")
             self.info_label.setText(
                 "複数選択中です。タグ / コレクション / メモを入力して『選択中に一括適用』を押してください。"
             )
 
-            rows = [self.db.get_video(video_id) for video_id in selected_ids]
-            rows = [row for row in rows if row is not None]
-
-            common_collection = common_single_value([row["collections"] or "" for row in rows])
-            common_tags = common_csv_values([row["tags"] or "" for row in rows])
+            common_collection = common_single_value([row["collections"] or "" for row in selected_rows])
+            common_tags = common_csv_values([row["tags"] or "" for row in selected_rows])
 
             self._updating_fields = True
             self.collections_edit.setText(common_collection)
@@ -907,8 +1074,8 @@ class MainWindow(QMainWindow):
             self.sync_tag_buttons_from_text()
             return
 
-        video_id = int(items[0].data(Qt.UserRole))
-        row = self.db.get_video(video_id)
+        video_id = selected_ids[0]
+        row = row_map.get(video_id)
         if row is None:
             self.clear_detail()
             return
@@ -918,10 +1085,18 @@ class MainWindow(QMainWindow):
         self.path_label.setText(row["absolute_path"] or "")
 
         size_mb = (row["file_size"] or 0) / (1024 * 1024)
+        status_parts = []
+        if row["is_missing"]:
+            status_parts.append("リンク切れ")
+        else:
+            status_parts.append("正常")
+        if row["is_ignored"]:
+            status_parts.append("無視中")
+
         info = (
             f"ファイル名: {row['filename']}\n"
             f"サイズ: {size_mb:.2f} MB\n"
-            f"状態: {'リンク切れ' if row['is_missing'] else '正常'}"
+            f"状態: {' / '.join(status_parts)}"
         )
         self.info_label.setText(info)
 
@@ -1011,7 +1186,8 @@ class MainWindow(QMainWindow):
             collections=normalize_single_value(self.collections_edit.text()),
             note=self.note_edit.toPlainText().strip(),
         )
-        self.reload_list()
+        self._mark_filter_lists_dirty()
+        self.reload_list(force_refresh_filters=True)
         QMessageBox.information(self, APP_NAME, "保存しました。")
 
     def get_selected_video_ids(self) -> list[int]:
@@ -1027,20 +1203,23 @@ class MainWindow(QMainWindow):
         tag_value = normalize_csv_text(self.tags_edit.text())
         note_value = self.note_edit.toPlainText().strip()
 
-        for video_id in video_ids:
-            row = self.db.get_video(video_id)
-            if row is None:
-                continue
+        rows = self.db.get_videos_by_ids(video_ids)
+        updates: list[tuple[str, str, str, str, int]] = []
 
-            self.db.update_video_metadata(
-                video_id=video_id,
-                title=row["title"] or "Untitled",
-                tags=merge_csv_values(row["tags"] or "", tag_value),
-                collections=collection_value if collection_value else (row["collections"] or ""),
-                note=note_value if note_value else (row["note"] or ""),
+        for row in rows:
+            updates.append(
+                (
+                    row["title"] or "Untitled",
+                    merge_csv_values(row["tags"] or "", tag_value),
+                    collection_value if collection_value else (row["collections"] or ""),
+                    note_value if note_value else (row["note"] or ""),
+                    int(row["id"]),
+                )
             )
 
-        self.reload_list()
+        self.db.update_video_metadata_bulk(updates)
+        self._mark_filter_lists_dirty()
+        self.reload_list(force_refresh_filters=True)
         QMessageBox.information(self, APP_NAME, f"{len(video_ids)}件に一括適用しました。")
 
     def build_context_menu(self) -> QMenu:
@@ -1070,8 +1249,11 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
 
-        ignore_action = menu.addAction("選択中を無視")
+        ignore_action = menu.addAction("無視する")
         ignore_action.triggered.connect(self.ignore_selected_videos)
+
+        unignore_action = menu.addAction("無視を解除")
+        unignore_action.triggered.connect(self.unignore_selected_videos)
 
         return menu
 
@@ -1092,40 +1274,46 @@ class MainWindow(QMainWindow):
         if not video_ids:
             return
 
-        for video_id in video_ids:
-            row = self.db.get_video(video_id)
-            if row is None:
-                continue
+        rows = self.db.get_videos_by_ids(video_ids)
+        updates: list[tuple[str, str, str, str, int]] = []
 
-            self.db.update_video_metadata(
-                video_id=video_id,
-                title=row["title"] or "Untitled",
-                tags=row["tags"] or "",
-                collections=collection_name,
-                note=row["note"] or "",
+        for row in rows:
+            updates.append(
+                (
+                    row["title"] or "Untitled",
+                    row["tags"] or "",
+                    collection_name,
+                    row["note"] or "",
+                    int(row["id"]),
+                )
             )
 
-        self.reload_list()
+        self.db.update_video_metadata_bulk(updates)
+        self._mark_filter_lists_dirty()
+        self.reload_list(force_refresh_filters=True)
 
     def apply_quick_tag(self, tag_name: str) -> None:
         video_ids = self.get_selected_video_ids()
         if not video_ids:
             return
 
-        for video_id in video_ids:
-            row = self.db.get_video(video_id)
-            if row is None:
-                continue
+        rows = self.db.get_videos_by_ids(video_ids)
+        updates: list[tuple[str, str, str, str, int]] = []
 
-            self.db.update_video_metadata(
-                video_id=video_id,
-                title=row["title"] or "Untitled",
-                tags=merge_csv_values(row["tags"] or "", tag_name),
-                collections=row["collections"] or "",
-                note=row["note"] or "",
+        for row in rows:
+            updates.append(
+                (
+                    row["title"] or "Untitled",
+                    merge_csv_values(row["tags"] or "", tag_name),
+                    row["collections"] or "",
+                    row["note"] or "",
+                    int(row["id"]),
+                )
             )
 
-        self.reload_list()
+        self.db.update_video_metadata_bulk(updates)
+        self._mark_filter_lists_dirty()
+        self.reload_list(force_refresh_filters=True)
 
     def ignore_selected_videos(self) -> None:
         video_ids = self.get_selected_video_ids()
@@ -1144,8 +1332,30 @@ class MainWindow(QMainWindow):
             return
 
         self.db.set_ignored(video_ids, ignored=True)
-        self.reload_list()
+        self._mark_filter_lists_dirty()
+        self.reload_list(force_refresh_filters=True)
         QMessageBox.information(self, APP_NAME, f"{len(video_ids)}件を無視しました。")
+
+    def unignore_selected_videos(self) -> None:
+        video_ids = self.get_selected_video_ids()
+        if not video_ids:
+            QMessageBox.information(self, APP_NAME, "無視解除する動画を選択してください。")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            APP_NAME,
+            f"{len(video_ids)}件の無視を解除しますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.db.set_ignored(video_ids, ignored=False)
+        self._mark_filter_lists_dirty()
+        self.reload_list(force_refresh_filters=True)
+        QMessageBox.information(self, APP_NAME, f"{len(video_ids)}件の無視を解除しました。")
 
     def open_selected_video(self) -> None:
         selected_ids = self.get_selected_video_ids()
