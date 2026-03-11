@@ -861,9 +861,11 @@ class MainWindow(QMainWindow):
 
     def get_folder_label(self, relative_path: str) -> str:
         parent = str(Path(relative_path).parent)
+
         if parent in ("", "."):
             return "ルート"
-        return parent.replace("\", "/")
+
+        return parent.replace(os.sep, "/")
 
     def _populate_folder_tree(self, folders: list[str]) -> None:
         all_item = QTreeWidgetItem(["すべて"])
