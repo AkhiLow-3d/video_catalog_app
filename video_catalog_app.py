@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import sqlite3
 import hashlib
 import subprocess
@@ -8,7 +9,7 @@ from typing import Optional
 
 import cv2
 from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QAction, QCursor, QIcon, QPixmap
+from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -36,6 +37,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "video_catalog_data"
 THUMB_DIR = DATA_DIR / "thumbnails"
 DB_PATH = DATA_DIR / "catalog.db"
+
 VIDEO_EXTENSIONS = {
     ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".m4v", ".flv", ".mpeg", ".mpg"
 }
@@ -66,6 +68,91 @@ PRESET_TAGS = [
     "2D風",
     "背景",
 ]
+
+
+def parse_csv_text(text: str) -> list[str]:
+    return [p.strip() for p in text.replace("、", ",").split(",") if p.strip()]
+
+
+def normalize_single_value(text: str) -> str:
+    parts = parse_csv_text(text)
+    return parts[0] if parts else ""
+
+
+def normalize_csv_text(text: str) -> str:
+    parts = parse_csv_text(text)
+    seen: list[str] = []
+    for p in parts:
+        if p not in seen:
+            seen.append(p)
+    return ", ".join(seen)
+
+
+def merge_csv_values(base_text: str, add_text: str) -> str:
+    merged = parse_csv_text(base_text) + parse_csv_text(add_text)
+    seen: list[str] = []
+    for value in merged:
+        if value not in seen:
+            seen.append(value)
+    return ", ".join(seen)
+
+
+def common_single_value(values: list[str]) -> str:
+    normalized = [normalize_single_value(value) for value in values if normalize_single_value(value)]
+    if not normalized:
+        return ""
+    first = normalized[0]
+    return first if all(value == first for value in normalized) else ""
+
+
+def common_csv_values(values: list[str]) -> list[str]:
+    parsed = [set(parse_csv_text(value)) for value in values]
+    parsed = [value_set for value_set in parsed if value_set]
+    if not parsed:
+        return []
+    common = set.intersection(*parsed)
+    return sorted(common)
+
+
+def ensure_thumbnail(video_path: Path) -> Optional[Path]:
+    THUMB_DIR.mkdir(parents=True, exist_ok=True)
+
+    key = hashlib.sha1(str(video_path).encode("utf-8", errors="ignore")).hexdigest()
+    thumb_path = THUMB_DIR / f"{key}.jpg"
+
+    try:
+        stat = video_path.stat()
+        if thumb_path.exists() and thumb_path.stat().st_mtime >= stat.st_mtime:
+            return thumb_path
+    except Exception:
+        pass
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+
+    try:
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        target_frame = max(0, min(frame_count - 1, int(frame_count * 0.1))) if frame_count > 0 else 0
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        success, frame = cap.read()
+
+        if not success or frame is None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            success, frame = cap.read()
+
+        if not success or frame is None:
+            return None
+
+        height, width = frame.shape[:2]
+        scale = THUMB_SIZE / max(width, height)
+        new_w = max(1, int(width * scale))
+        new_h = max(1, int(height * scale))
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        cv2.imwrite(str(thumb_path), resized)
+        return thumb_path
+    finally:
+        cap.release()
 
 
 class Database:
@@ -114,22 +201,35 @@ class Database:
         self.conn.commit()
 
     def _ensure_columns(self) -> None:
-        columns = {
-            row["name"] for row in self.conn.execute("PRAGMA table_info(videos)").fetchall()
-        }
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(videos)").fetchall()}
         if "is_ignored" not in columns:
             self.conn.execute("ALTER TABLE videos ADD COLUMN is_ignored INTEGER DEFAULT 0")
             self.conn.commit()
 
+    def reset_all_data(self) -> None:
+        self.conn.close()
+        if self.db_path.exists():
+            self.db_path.unlink()
+        if THUMB_DIR.exists():
+            shutil.rmtree(THUMB_DIR, ignore_errors=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        THUMB_DIR.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn.row_factory = sqlite3.Row
+        self._create_tables()
+        self._ensure_columns()
+
     def get_or_create_library(self, root_path: Path) -> int:
         row = self.conn.execute(
-            "SELECT id FROM libraries WHERE root_path = ?", (str(root_path),)
+            "SELECT id FROM libraries WHERE root_path = ?",
+            (str(root_path),),
         ).fetchone()
         if row:
             return int(row["id"])
 
         cur = self.conn.execute(
-            "INSERT INTO libraries (root_path) VALUES (?)", (str(root_path),)
+            "INSERT INTO libraries (root_path) VALUES (?)",
+            (str(root_path),),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -210,7 +310,12 @@ class Database:
         )
         self.conn.commit()
 
-    def get_videos(self, search_text: str = "", missing_only: bool = False, include_ignored: bool = False):
+    def get_videos(
+        self,
+        search_text: str = "",
+        missing_only: bool = False,
+        include_ignored: bool = False,
+    ):
         query = "SELECT * FROM videos"
         clauses = []
         params = []
@@ -235,9 +340,19 @@ class Database:
         return self.conn.execute(query, params).fetchall()
 
     def get_video(self, video_id: int):
-        return self.conn.execute("SELECT * FROM videos WHERE id = ?", (video_id,)).fetchone()
+        return self.conn.execute(
+            "SELECT * FROM videos WHERE id = ?",
+            (video_id,),
+        ).fetchone()
 
-    def update_video_metadata(self, video_id: int, title: str, tags: str, collections: str, note: str) -> None:
+    def update_video_metadata(
+        self,
+        video_id: int,
+        title: str,
+        tags: str,
+        collections: str,
+        note: str,
+    ) -> None:
         self.conn.execute(
             """
             UPDATE videos
@@ -268,8 +383,10 @@ class MainWindow(QMainWindow):
         self.collection_buttons: dict[str, QPushButton] = {}
         self.tag_buttons: dict[str, QPushButton] = {}
         self._updating_fields = False
+
         self.setWindowTitle(APP_NAME)
         self.resize(1500, 920)
+
         self._build_ui()
         self.reload_list()
 
@@ -278,6 +395,7 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
+
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(8, 8, 8, 8)
         root_layout.setSpacing(8)
@@ -374,6 +492,7 @@ class MainWindow(QMainWindow):
         collection_layout = QVBoxLayout(collection_box)
         collection_layout.setContentsMargins(0, 0, 0, 0)
         collection_layout.setSpacing(6)
+
         collection_grid = QGridLayout()
         collection_grid.setContentsMargins(0, 0, 0, 0)
         collection_grid.setHorizontalSpacing(6)
@@ -397,6 +516,7 @@ class MainWindow(QMainWindow):
         tag_layout = QVBoxLayout(tag_box)
         tag_layout.setContentsMargins(0, 0, 0, 0)
         tag_layout.setSpacing(6)
+
         tag_grid = QGridLayout()
         tag_grid.setContentsMargins(0, 0, 0, 0)
         tag_grid.setHorizontalSpacing(6)
@@ -457,6 +577,10 @@ class MainWindow(QMainWindow):
         ignore_action.triggered.connect(self.ignore_selected_videos)
         toolbar.addAction(ignore_action)
 
+        reset_action = QAction("データ初期化", self)
+        reset_action.triggered.connect(self.reset_all_data)
+        toolbar.addAction(reset_action)
+
     def _on_toggle_missing_filter(self, checked: bool) -> None:
         self.missing_filter_btn.setText(f"リンク切れのみ: {'ON' if checked else 'OFF'}")
         self.reload_list()
@@ -494,8 +618,26 @@ class MainWindow(QMainWindow):
             root = Path(row["root_path"])
             library_id = int(row["id"])
             self.scan_library(root, library_id)
+
         self.reload_list()
         QMessageBox.information(self, APP_NAME, "全ライブラリを再スキャンしました。")
+
+    def reset_all_data(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            APP_NAME,
+            "保存済みデータとサムネイルを初期化しますか？\n元の動画ファイルは削除されません。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.db.reset_all_data()
+        self.clear_all_filters()
+        self.clear_detail()
+        self.reload_list()
+        QMessageBox.information(self, APP_NAME, "データを初期化しました。")
 
     def scan_library(self, root: Path, library_id: int) -> None:
         self.db.mark_missing_for_library(library_id)
@@ -524,7 +666,7 @@ class MainWindow(QMainWindow):
                 self.db.conn.commit()
                 continue
 
-            thumb_path = self.ensure_thumbnail(path)
+            thumb_path = ensure_thumbnail(path)
             self.db.upsert_video(
                 library_id=library_id,
                 title=path.stem,
@@ -536,52 +678,16 @@ class MainWindow(QMainWindow):
                 modified_time=stat.st_mtime,
             )
 
-    def ensure_thumbnail(self, video_path: Path) -> Optional[Path]:
-        key = hashlib.sha1(str(video_path).encode("utf-8", errors="ignore")).hexdigest()
-        thumb_path = THUMB_DIR / f"{key}.jpg"
-
-        try:
-            stat = video_path.stat()
-            if thumb_path.exists() and thumb_path.stat().st_mtime >= stat.st_mtime:
-                return thumb_path
-        except Exception:
-            pass
-
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            return None
-
-        try:
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            target_frame = max(0, min(frame_count - 1, int(frame_count * 0.1))) if frame_count > 0 else 0
-            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-            success, frame = cap.read()
-
-            if not success or frame is None:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                success, frame = cap.read()
-
-            if not success or frame is None:
-                return None
-
-            height, width = frame.shape[:2]
-            scale = THUMB_SIZE / max(width, height)
-            new_w = max(1, int(width * scale))
-            new_h = max(1, int(height * scale))
-            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            cv2.imwrite(str(thumb_path), resized)
-            return thumb_path
-        finally:
-            cap.release()
-
     def reload_list(self) -> None:
         self.list_widget.clear()
 
         selected_collection_item = self.collection_list_widget.currentItem()
         selected_tag_item = self.tag_list_widget.currentItem()
+
         selected_collection = selected_collection_item.text() if selected_collection_item else ""
         if selected_collection == "すべて":
             selected_collection = ""
+
         selected_tag = selected_tag_item.text() if selected_tag_item else ""
         if selected_tag == "すべて":
             selected_tag = ""
@@ -608,7 +714,7 @@ class MainWindow(QMainWindow):
         if selected_tag:
             rows = [
                 row for row in rows
-                if selected_tag in self.parse_csv_text(row["tags"] or "")
+                if selected_tag in parse_csv_text(row["tags"] or "")
             ]
 
         for row in rows:
@@ -650,12 +756,24 @@ class MainWindow(QMainWindow):
             self.clear_detail()
 
     def refresh_filter_lists(self) -> None:
-        current_collection = self.collection_list_widget.currentItem().text() if self.collection_list_widget.currentItem() else ""
-        current_tag = self.tag_list_widget.currentItem().text() if self.tag_list_widget.currentItem() else ""
+        current_collection = (
+            self.collection_list_widget.currentItem().text()
+            if self.collection_list_widget.currentItem()
+            else ""
+        )
+        current_tag = (
+            self.tag_list_widget.currentItem().text()
+            if self.tag_list_widget.currentItem()
+            else ""
+        )
 
         all_rows = self.db.get_videos()
-        collections = sorted({(row["collections"] or "").strip() for row in all_rows if (row["collections"] or "").strip()})
-        tags = sorted({tag for row in all_rows for tag in self.parse_csv_text(row["tags"] or "")})
+        collections = sorted(
+            {(row["collections"] or "").strip() for row in all_rows if (row["collections"] or "").strip()}
+        )
+        tags = sorted(
+            {tag for row in all_rows for tag in parse_csv_text(row["tags"] or "")}
+        )
 
         self.collection_list_widget.blockSignals(True)
         self.tag_list_widget.blockSignals(True)
@@ -663,7 +781,6 @@ class MainWindow(QMainWindow):
         self.collection_list_widget.clear()
         self.tag_list_widget.clear()
 
-        # special filter items
         self.collection_list_widget.addItem("すべて")
         self.collection_list_widget.addItem("未分類")
         self.collection_list_widget.addItems(collections)
@@ -671,7 +788,6 @@ class MainWindow(QMainWindow):
         self.tag_list_widget.addItem("すべて")
         self.tag_list_widget.addItems(tags)
 
-        # restore selection
         if current_collection:
             matches = self.collection_list_widget.findItems(current_collection, Qt.MatchExactly)
             if matches:
@@ -715,18 +831,22 @@ class MainWindow(QMainWindow):
             selected_ids = [int(item.data(Qt.UserRole)) for item in items]
             self.title_edit.setText("")
             self.path_label.setText(f"{len(items)}件選択中")
-            self.info_label.setText("複数選択中です。タグ / コレクション / メモを入力して『選択中に一括適用』を押してください。")
+            self.info_label.setText(
+                "複数選択中です。タグ / コレクション / メモを入力して『選択中に一括適用』を押してください。"
+            )
 
             rows = [self.db.get_video(video_id) for video_id in selected_ids]
             rows = [row for row in rows if row is not None]
-            common_collection = self._common_single_value([row["collections"] or "" for row in rows])
-            common_tags = self._common_csv_values([row["tags"] or "" for row in rows])
+
+            common_collection = common_single_value([row["collections"] or "" for row in rows])
+            common_tags = common_csv_values([row["tags"] or "" for row in rows])
 
             self._updating_fields = True
             self.collections_edit.setText(common_collection)
             self.tags_edit.setText(", ".join(common_tags))
             self.note_edit.clear()
             self._updating_fields = False
+
             self.sync_collection_buttons_from_text()
             self.sync_tag_buttons_from_text()
             return
@@ -775,10 +895,11 @@ class MainWindow(QMainWindow):
     def _on_tag_button_clicked(self) -> None:
         selected_tags = [name for name, button in self.tag_buttons.items() if button.isChecked()]
         custom_tags = [
-            tag for tag in self.parse_csv_text(self.tags_edit.text())
+            tag for tag in parse_csv_text(self.tags_edit.text())
             if tag not in self.tag_buttons
         ]
         merged = selected_tags + [tag for tag in custom_tags if tag not in selected_tags]
+
         self._updating_fields = True
         self.tags_edit.setText(", ".join(merged))
         self._updating_fields = False
@@ -787,8 +908,9 @@ class MainWindow(QMainWindow):
         if self._updating_fields:
             return
 
-        selected = set(self.parse_csv_text(self.collections_edit.text())[:1])
+        selected = set(parse_csv_text(self.collections_edit.text())[:1])
         self._set_collection_buttons(selected)
+
         if selected:
             first = next(iter(selected))
             if self.collections_edit.text().strip() != first:
@@ -800,9 +922,10 @@ class MainWindow(QMainWindow):
         if self._updating_fields:
             return
 
-        selected = set(self.parse_csv_text(self.tags_edit.text()))
+        selected = set(parse_csv_text(self.tags_edit.text()))
         self._set_tag_buttons(selected)
-        normalized = self.normalize_csv_text(self.tags_edit.text())
+
+        normalized = normalize_csv_text(self.tags_edit.text())
         if self.tags_edit.text() != normalized:
             self._updating_fields = True
             self.tags_edit.setText(normalized)
@@ -818,24 +941,22 @@ class MainWindow(QMainWindow):
 
     def save_current_video(self) -> None:
         if self.current_video_id is None:
-            QMessageBox.information(self, APP_NAME, "単体保存の対象がありません。複数選択中なら『選択中に一括適用』を使ってください。")
+            QMessageBox.information(
+                self,
+                APP_NAME,
+                "単体保存の対象がありません。複数選択中なら『選択中に一括適用』を使ってください。",
+            )
             return
-
-        collection_value = self.normalize_single_value(self.collections_edit.text())
-        tag_value = self.normalize_csv_text(self.tags_edit.text())
 
         self.db.update_video_metadata(
             video_id=self.current_video_id,
             title=self.title_edit.text().strip() or "Untitled",
-            tags=tag_value,
-            collections=collection_value,
+            tags=normalize_csv_text(self.tags_edit.text()),
+            collections=normalize_single_value(self.collections_edit.text()),
             note=self.note_edit.toPlainText().strip(),
         )
         self.reload_list()
         QMessageBox.information(self, APP_NAME, "保存しました。")
-
-    def parse_csv_text(self, text: str) -> list[str]:
-        return [p.strip() for p in text.replace("、", ",").split(",") if p.strip()]
 
     def get_selected_video_ids(self) -> list[int]:
         return [int(item.data(Qt.UserRole)) for item in self.list_widget.selectedItems()]
@@ -846,8 +967,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_NAME, "先に動画を選択してください。")
             return
 
-        collection_value = self.normalize_single_value(self.collections_edit.text())
-        tag_value = self.normalize_csv_text(self.tags_edit.text())
+        collection_value = normalize_single_value(self.collections_edit.text())
+        tag_value = normalize_csv_text(self.tags_edit.text())
         note_value = self.note_edit.toPlainText().strip()
 
         for video_id in video_ids:
@@ -855,56 +976,16 @@ class MainWindow(QMainWindow):
             if row is None:
                 continue
 
-            title_value = row["title"] or "Untitled"
-            merged_collection = collection_value if collection_value else (row["collections"] or "")
-            merged_tags = self.merge_csv_values(row["tags"] or "", tag_value)
-            merged_note = note_value if note_value else (row["note"] or "")
-
             self.db.update_video_metadata(
                 video_id=video_id,
-                title=title_value,
-                tags=merged_tags,
-                collections=merged_collection,
-                note=merged_note,
+                title=row["title"] or "Untitled",
+                tags=merge_csv_values(row["tags"] or "", tag_value),
+                collections=collection_value if collection_value else (row["collections"] or ""),
+                note=note_value if note_value else (row["note"] or ""),
             )
 
         self.reload_list()
         QMessageBox.information(self, APP_NAME, f"{len(video_ids)}件に一括適用しました。")
-
-    def merge_csv_values(self, base_text: str, add_text: str) -> str:
-        merged = self.parse_csv_text(base_text) + self.parse_csv_text(add_text)
-        seen = []
-        for value in merged:
-            if value not in seen:
-                seen.append(value)
-        return ", ".join(seen)
-
-    def _common_single_value(self, values: list[str]) -> str:
-        normalized = [self.normalize_single_value(value) for value in values if self.normalize_single_value(value)]
-        if not normalized:
-            return ""
-        first = normalized[0]
-        return first if all(value == first for value in normalized) else ""
-
-    def _common_csv_values(self, values: list[str]) -> list[str]:
-        parsed = [set(self.parse_csv_text(value)) for value in values]
-        parsed = [value_set for value_set in parsed if value_set]
-        if not parsed:
-            return []
-        common = set.intersection(*parsed)
-        return sorted(common)
-
-    def normalize_single_value(self, text: str) -> str:
-        parts = self.parse_csv_text(text)
-        return parts[0] if parts else ""
-
-    def normalize_csv_text(self, text: str) -> str:
-        parts = self.parse_csv_text(text)
-        seen = []
-        for p in parts:
-            if p not in seen:
-                seen.append(p)
-        return ", ".join(seen)
 
     def build_context_menu(self) -> QMenu:
         menu = QMenu(self)
@@ -917,7 +998,9 @@ class MainWindow(QMainWindow):
         collection_menu = menu.addMenu("コレクション設定")
         for name in PRESET_COLLECTIONS:
             action = collection_menu.addAction(name)
-            action.triggered.connect(lambda checked=False, value=name: self.apply_quick_collection(value))
+            action.triggered.connect(
+                lambda checked=False, value=name: self.apply_quick_collection(value)
+            )
 
         clear_collection_action = collection_menu.addAction("コレクション解除")
         clear_collection_action.triggered.connect(lambda: self.apply_quick_collection(""))
@@ -925,7 +1008,9 @@ class MainWindow(QMainWindow):
         tag_menu = menu.addMenu("タグ追加")
         for name in PRESET_TAGS:
             action = tag_menu.addAction(name)
-            action.triggered.connect(lambda checked=False, value=name: self.apply_quick_tag(value))
+            action.triggered.connect(
+                lambda checked=False, value=name: self.apply_quick_tag(value)
+            )
 
         menu.addSeparator()
 
@@ -955,6 +1040,7 @@ class MainWindow(QMainWindow):
             row = self.db.get_video(video_id)
             if row is None:
                 continue
+
             self.db.update_video_metadata(
                 video_id=video_id,
                 title=row["title"] or "Untitled",
@@ -974,11 +1060,11 @@ class MainWindow(QMainWindow):
             row = self.db.get_video(video_id)
             if row is None:
                 continue
-            merged_tags = self.merge_csv_values(row["tags"] or "", tag_name)
+
             self.db.update_video_metadata(
                 video_id=video_id,
                 title=row["title"] or "Untitled",
-                tags=merged_tags,
+                tags=merge_csv_values(row["tags"] or "", tag_name),
                 collections=row["collections"] or "",
                 note=row["note"] or "",
             )
@@ -1032,7 +1118,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self.db.close()
         super().closeEvent(event)
-
 
 
 def main() -> None:
