@@ -28,6 +28,8 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTextEdit,
     QToolBar,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -43,6 +45,7 @@ VIDEO_EXTENSIONS = {
 }
 THUMB_SIZE = 220
 
+# ここを編集すると、コレクションのプリセット候補を変更できます。
 PRESET_COLLECTIONS = [
     "モデリング",
     "アニメーション",
@@ -54,6 +57,7 @@ PRESET_COLLECTIONS = [
     "チュートリアル",
 ]
 
+# ここを編集すると、タグのプリセット候補を変更できます。
 PRESET_TAGS = [
     "wood",
     "metal",
@@ -435,6 +439,12 @@ class MainWindow(QMainWindow):
         self.tag_list_widget.itemClicked.connect(self.on_tag_list_clicked)
         left_layout.addWidget(self.tag_list_widget)
 
+        left_layout.addWidget(QLabel("フォルダ一覧"))
+        self.folder_tree_widget = QTreeWidget()
+        self.folder_tree_widget.setHeaderHidden(True)
+        self.folder_tree_widget.itemClicked.connect(self.on_folder_tree_clicked)
+        left_layout.addWidget(self.folder_tree_widget)
+
         filter_row = QHBoxLayout()
         left_layout.addLayout(filter_row)
 
@@ -595,6 +605,7 @@ class MainWindow(QMainWindow):
         self.unclassified_filter_btn.setChecked(False)
         self.collection_list_widget.clearSelection()
         self.tag_list_widget.clearSelection()
+        self.folder_tree_widget.clearSelection()
         self.reload_list()
 
     def add_library_folder(self) -> None:
@@ -683,6 +694,7 @@ class MainWindow(QMainWindow):
 
         selected_collection_item = self.collection_list_widget.currentItem()
         selected_tag_item = self.tag_list_widget.currentItem()
+        selected_folder_item = self.folder_tree_widget.currentItem()
 
         selected_collection = selected_collection_item.text() if selected_collection_item else ""
         if selected_collection == "すべて":
@@ -691,6 +703,10 @@ class MainWindow(QMainWindow):
         selected_tag = selected_tag_item.text() if selected_tag_item else ""
         if selected_tag == "すべて":
             selected_tag = ""
+
+        selected_folder = selected_folder_item.data(0, Qt.UserRole) if selected_folder_item else ""
+        if selected_folder == "__ALL__":
+            selected_folder = ""
 
         rows = self.db.get_videos(
             search_text=self.search_input.text(),
@@ -715,6 +731,17 @@ class MainWindow(QMainWindow):
             rows = [
                 row for row in rows
                 if selected_tag in parse_csv_text(row["tags"] or "")
+            ]
+
+        if selected_folder == "ルート":
+            rows = [
+                row for row in rows
+                if not str(Path(row["relative_path"] or "").parent).replace(".", "").strip()
+            ]
+        elif selected_folder:
+            rows = [
+                row for row in rows
+                if self.get_folder_label(row["relative_path"] or "") == selected_folder
             ]
 
         for row in rows:
@@ -766,6 +793,11 @@ class MainWindow(QMainWindow):
             if self.tag_list_widget.currentItem()
             else ""
         )
+        current_folder = (
+            self.folder_list_widget.currentItem().text()
+            if self.folder_list_widget.currentItem()
+            else ""
+        )
 
         all_rows = self.db.get_videos()
         collections = sorted(
@@ -774,12 +806,17 @@ class MainWindow(QMainWindow):
         tags = sorted(
             {tag for row in all_rows for tag in parse_csv_text(row["tags"] or "")}
         )
+        folders = sorted(
+            {self.get_folder_label(row["relative_path"] or "") for row in all_rows}
+        )
 
         self.collection_list_widget.blockSignals(True)
         self.tag_list_widget.blockSignals(True)
+        self.folder_tree_widget.blockSignals(True)
 
         self.collection_list_widget.clear()
         self.tag_list_widget.clear()
+        self.folder_tree_widget.clear()
 
         self.collection_list_widget.addItem("すべて")
         self.collection_list_widget.addItem("未分類")
@@ -787,6 +824,8 @@ class MainWindow(QMainWindow):
 
         self.tag_list_widget.addItem("すべて")
         self.tag_list_widget.addItems(tags)
+
+        self._populate_folder_tree(folders)
 
         if current_collection:
             matches = self.collection_list_widget.findItems(current_collection, Qt.MatchExactly)
@@ -798,16 +837,85 @@ class MainWindow(QMainWindow):
             if matches:
                 self.tag_list_widget.setCurrentItem(matches[0])
 
+        if current_folder:
+            self._restore_folder_tree_selection(current_folder)
+
         self.collection_list_widget.blockSignals(False)
         self.tag_list_widget.blockSignals(False)
+        self.folder_tree_widget.blockSignals(False)
 
     def on_collection_list_clicked(self, item: QListWidgetItem) -> None:
         self.tag_list_widget.clearSelection()
+        self.folder_tree_widget.clearSelection()
         self.reload_list()
 
     def on_tag_list_clicked(self, item: QListWidgetItem) -> None:
         self.collection_list_widget.clearSelection()
+        self.folder_tree_widget.clearSelection()
         self.reload_list()
+
+    def on_folder_tree_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        self.collection_list_widget.clearSelection()
+        self.tag_list_widget.clearSelection()
+        self.reload_list()
+
+    def get_folder_label(self, relative_path: str) -> str:
+        parent = str(Path(relative_path).parent)
+        if parent in ("", "."):
+            return "ルート"
+        return parent.replace("\", "/")
+
+    def _populate_folder_tree(self, folders: list[str]) -> None:
+        all_item = QTreeWidgetItem(["すべて"])
+        all_item.setData(0, Qt.UserRole, "__ALL__")
+        self.folder_tree_widget.addTopLevelItem(all_item)
+
+        root_item = QTreeWidgetItem(["ルート"])
+        root_item.setData(0, Qt.UserRole, "ルート")
+        self.folder_tree_widget.addTopLevelItem(root_item)
+
+        node_map: dict[str, QTreeWidgetItem] = {"ルート": root_item}
+
+        for folder in folders:
+            if folder == "ルート":
+                continue
+            parts = folder.split("/")
+            current_path = ""
+            parent_item = None
+            for part in parts:
+                current_path = part if not current_path else f"{current_path}/{part}"
+                if current_path not in node_map:
+                    item = QTreeWidgetItem([part])
+                    item.setData(0, Qt.UserRole, current_path)
+                    if parent_item is None:
+                        self.folder_tree_widget.addTopLevelItem(item)
+                    else:
+                        parent_item.addChild(item)
+                    node_map[current_path] = item
+                parent_item = node_map[current_path]
+
+        self.folder_tree_widget.expandToDepth(0)
+
+    def _restore_folder_tree_selection(self, target_path: str) -> None:
+        def walk(item: QTreeWidgetItem):
+            if item.data(0, Qt.UserRole) == target_path:
+                return item
+            for i in range(item.childCount()):
+                found = walk(item.child(i))
+                if found is not None:
+                    return found
+            return None
+
+        for i in range(self.folder_tree_widget.topLevelItemCount()):
+            item = self.folder_tree_widget.topLevelItem(i)
+            found = walk(item)
+            if found is not None:
+                self.folder_tree_widget.setCurrentItem(found)
+                parent = found.parent()
+                while parent is not None:
+                    parent.setExpanded(True)
+                    parent = parent.parent()
+                break
 
     def clear_detail(self) -> None:
         self.current_video_id = None
